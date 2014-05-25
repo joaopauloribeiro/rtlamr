@@ -18,33 +18,35 @@ package main
 
 import (
 	"errors"
-	"flag"
 	"fmt"
-	"io"
 	"log"
 	"math"
-	"math/cmplx"
-	"net"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/bemasher/fftw"
 	"github.com/bemasher/rtltcp"
+
+	"github.com/bemasher/rtlamr/bch"
+	"github.com/bemasher/rtlamr/preamble"
 )
 
 const (
-	BlockSize = 1 << 14
+	BlockSize = 1 << 12
 
-	SampleRate   = 2.4e6
-	DataRate     = 32.768e3
-	SymbolLength = SampleRate / DataRate
+	DataRate     = 32768
+	SymbolLength = 73
+	SampleRate   = DataRate * SymbolLength
+
+	PreambleSymbols = 42
+	PreambleLength  = PreambleSymbols * SymbolLength
 
 	PacketSymbols = 192
 	PacketLength  = PacketSymbols * SymbolLength
 
-	PreambleDFTSize = 20480
+	PreambleDFTSize = 8192
 
 	CenterFreq    = 920299072
 	RestrictLocal = false
@@ -52,104 +54,52 @@ const (
 	Preamble     = 0x1F2A60
 	PreambleBits = "111110010101001100000"
 
-	GenPoly    = 0x16F63
-	MsgLen     = 10
-	ErrorCount = 1
+	GenPoly = 0x16F63
 
 	TimeFormat = "2006-01-02T15:04:05.000"
 )
 
-var SymLen = IntRound(SymbolLength)
 var config Config
-
-type Config struct {
-	serverAddr     string
-	logFilename    string
-	sampleFilename string
-
-	ServerAddr *net.TCPAddr
-	CenterFreq uint
-	TimeLimit  time.Duration
-	LogFile    *os.File
-	SampleFile *os.File
-}
-
-func (c Config) String() string {
-	return fmt.Sprintf("{ServerAddr:%s Freq:%d TimeLimit:%s LogFile:%s SampleFile:%s}",
-		c.ServerAddr,
-		c.CenterFreq,
-		c.TimeLimit,
-		c.LogFile.Name(),
-		c.SampleFile.Name(),
-	)
-}
-
-func (c *Config) Parse() (err error) {
-	flag.StringVar(&c.serverAddr, "server", "127.0.0.1:1234", "address or hostname of rtl_tcp instance")
-	flag.StringVar(&c.logFilename, "logfile", "/dev/stdout", "log statement dump file")
-	flag.StringVar(&c.sampleFilename, "samplefile", os.DevNull, "received message signal dump file, offset and message length are displayed to log when enabled")
-	flag.UintVar(&c.CenterFreq, "centerfreq", 920299072, "center frequency to receive on")
-	flag.DurationVar(&c.TimeLimit, "duration", 0, "time to run for, 0 for infinite")
-
-	flag.Parse()
-
-	c.ServerAddr, err = net.ResolveTCPAddr("tcp", c.serverAddr)
-	if err != nil {
-		return
-	}
-
-	if c.logFilename == "/dev/stdout" {
-		c.LogFile = os.Stdout
-	} else {
-		c.LogFile, err = os.Create(c.logFilename)
-	}
-	if err != nil {
-		return
-	}
-
-	log.SetOutput(c.LogFile)
-	log.SetFlags(log.Lshortfile)
-
-	c.SampleFile, err = os.Create(c.sampleFilename)
-	if err != nil {
-		return
-	}
-
-	return
-}
-
-func (c Config) Close() {
-	c.LogFile.Close()
-	c.SampleFile.Close()
-}
 
 type Receiver struct {
 	rtltcp.SDR
 
-	pd  PreambleDetector
-	bch BCH
+	pd  preamble.PreambleDetector
+	bch bch.BCH
+	lut MagLUT
 }
 
 func NewReceiver(blockSize int) (rcvr Receiver) {
-	rcvr.pd = NewPreambleDetector()
+	// Plan the preamble detector.
+	rcvr.pd = preamble.NewPreambleDetector(PreambleDFTSize, SymbolLength, PreambleBits)
 
-	rcvr.bch = NewBCH(GenPoly)
-	log.Printf("BCH: %+v\n", rcvr.bch)
-
-	if err := rcvr.Connect(config.ServerAddr); err != nil {
-		log.Fatal(err)
+	// Create a new BCH for error detection.
+	rcvr.bch = bch.NewBCH(GenPoly)
+	if !config.Quiet {
+		config.Log.Printf("BCH: %+v\n", rcvr.bch)
 	}
 
-	log.Println("GainCount:", rcvr.SDR.Info.GainCount)
+	rcvr.lut = NewMagLUT()
 
+	// Connect to rtl_tcp server.
+	if err := rcvr.Connect(config.ServerAddr); err != nil {
+		config.Log.Fatal(err)
+	}
+
+	// Tell the user how many gain settings were reported by rtl_tcp.
+	if !config.Quiet {
+		config.Log.Println("GainCount:", rcvr.SDR.Info.GainCount)
+	}
+
+	// Set some parameters for listening.
 	rcvr.SetSampleRate(SampleRate)
 	rcvr.SetCenterFreq(uint32(config.CenterFreq))
-	rcvr.SetOffsetTuning(true)
 	rcvr.SetGainMode(true)
 
 	return
 }
 
+// Clean up rtl_tcp connection and destroy preamble detection plan.
 func (rcvr *Receiver) Close() {
 	rcvr.SDR.Close()
 	rcvr.pd.Close()
@@ -158,12 +108,11 @@ func (rcvr *Receiver) Close() {
 func (rcvr *Receiver) Run() {
 	// Setup signal channel for interruption.
 	sigint := make(chan os.Signal, 1)
-	signal.Notify(sigint)
+	signal.Notify(sigint, os.Kill, os.Interrupt)
 
 	// Allocate sample and demodulated signal buffers.
-	block := make([]byte, BlockSize<<1)
-	raw := make([]byte, BlockSize<<2)
-	amBuf := make([]float64, BlockSize<<1)
+	raw := make([]byte, (PacketLength+BlockSize)<<1)
+	amBuf := make([]float64, PacketLength+BlockSize)
 
 	// Setup time limit channel
 	tLimit := make(<-chan time.Time, 1)
@@ -181,214 +130,134 @@ func (rcvr *Receiver) Run() {
 			fmt.Println("Time Limit Reached:", time.Since(start))
 			return
 		default:
-			// Rotate sample and raw buffer.
-			copy(raw[:BlockSize<<1], raw[BlockSize<<1:])
-			copy(amBuf[:BlockSize], amBuf[BlockSize:])
+			copy(raw, raw[BlockSize<<1:])
+			copy(amBuf, amBuf[BlockSize:])
 
 			// Read new sample block.
-			_, err := io.ReadFull(rcvr, block)
+			_, err := rcvr.Read(raw[PacketLength<<1:])
 			if err != nil {
-				log.Fatal("Error reading samples:", err)
+				config.Log.Fatal("Error reading samples:", err)
 			}
 
-			// Store the block to dump the message if necessary
-			copy(raw[BlockSize<<1:], block)
-
 			// AM Demodulate
-			for i := 0; i < BlockSize; i++ {
-				amBuf[BlockSize+i] = Mag(block[i<<1], block[(i<<1)+1])
+			block := amBuf[PacketLength:]
+			for idx := range block {
+				block[idx] = math.Sqrt(rcvr.lut[raw[(idx)<<1]] + rcvr.lut[raw[((idx)<<1)+1]])
 			}
 
 			// Detect preamble in first half of demod buffer.
-			copy(rcvr.pd.r, amBuf)
-			align := rcvr.pd.Execute()
+			rcvr.pd.Execute(amBuf)
+			align := rcvr.pd.ArgMax()
 
 			// Bad framing, catch message on next block.
 			if align > BlockSize {
 				continue
 			}
 
-			// Filter signal and bit slice.
-			filtered := MatchedFilter(amBuf[align:])
-			bits := ""
-			for i := range filtered {
-				if filtered[i] > 0 {
-					bits += "1"
-				} else {
-					bits += "0"
-				}
-			}
+			// Filter signal and bit slice enough data to catch the preamble.
+			filtered := MatchedFilter(amBuf[align:], PreambleSymbols>>1)
+			bits := BitSlice(filtered)
 
-			// Convert bitstring to bytes for BCH.
-			data := make([]byte, 10)
-			for i := range data {
-				idx := i<<3 + 16
-				b, err := strconv.ParseUint(bits[idx:idx+8], 2, 8)
-				if err != nil {
-					log.Fatal("Error parsing byte:", err)
-				}
-				data[i] = byte(b)
-			}
+			// If the preamble matches.
+			if bits == PreambleBits {
+				// Filter, slice and parse the rest of the buffered samples.
+				filtered := MatchedFilter(amBuf[align:], PacketSymbols>>1)
+				bits := BitSlice(filtered)
 
-			// Calculate the syndrome to track which bits were corrected later
-			// for logging.
-			syn := rcvr.bch.Encode(data)
-
-			// Correct errors
-			checksum, corrected := rcvr.bch.Correct(data)
-
-			// If the preamble matches and the corrected checksum is 0 we
-			// probably have a message.
-			if bits[:21] == PreambleBits && checksum == 0 {
-				// Convert back to bitstring for parsing (should probably
-				// write a method for parsing from bytes)
-				bits = bits[:16]
-				for i := range data {
-					bits += fmt.Sprintf("%08b", data[i])
+				// If the checksum fails, bail.
+				if rcvr.bch.Encode(bits[16:]) != 0 {
+					continue
 				}
 
 				// Parse SCM
 				scm, err := ParseSCM(bits)
 				if err != nil {
-					log.Fatal("Error parsing SCM:", err)
+					config.Log.Fatal("Error parsing SCM:", err)
 				}
 
-				// Calculate message bounds.
-				lower := (align - IntRound(8*SymbolLength)) << 1
-				if lower < 0 {
-					lower = 0
+				// If filtering by ID and ID doesn't match, bail.
+				if config.MeterID != 0 && uint(scm.ID) != config.MeterID {
+					continue
 				}
-				upper := (align + IntRound(PacketLength+8*SymbolLength)) << 1
+
+				// Get current file offset.
+				offset, err := config.SampleFile.Seek(0, os.SEEK_CUR)
+				if err != nil {
+					config.Log.Fatal("Error getting sample file offset:", err)
+				}
 
 				// Dump message to file.
-				_, err = config.SampleFile.Write(raw[lower:upper])
+				_, err = config.SampleFile.Write(raw)
 				if err != nil {
-					log.Fatal("Error dumping samples:", err)
+					config.Log.Fatal("Error dumping samples:", err)
 				}
 
-				fmt.Fprintf(config.LogFile, "%s %+v ", time.Now().Format(TimeFormat), scm)
+				msg := Message{time.Now(), offset, len(raw), scm}
 
-				if config.sampleFilename != os.DevNull {
-					offset, err := config.SampleFile.Seek(0, os.SEEK_CUR)
+				// Write or encode message to log file.
+				if config.Encoder == nil {
+					// A nil encoder is just plain-text output.
+					fmt.Fprintf(config.LogFile, "%+v", msg)
+				} else {
+					err = config.Encoder.Encode(msg)
 					if err != nil {
-						log.Fatal("Error getting sample file offset:", err)
+						log.Fatal("Error encoding message:", err)
 					}
 
-					fmt.Printf("%d %d ", offset, upper-lower)
+					// The XML encoder doesn't write new lines after each
+					// element, add them.
+					if strings.ToLower(config.format) == "xml" {
+						fmt.Fprintln(config.LogFile)
+					}
 				}
 
-				// If we corrected any errors, print their positions.
-				if corrected {
-					fmt.Fprintf(config.LogFile, "%d\n", rcvr.bch.Syndromes[syn])
-				} else {
-					fmt.Fprintln(config.LogFile)
+				if config.Single {
+					return
 				}
 			}
 		}
 	}
 }
 
-// Shift sample from unsigned and normalize.
-func Mag(i, q byte) float64 {
-	j := (127.5 - float64(i)) / 127
-	k := (127.5 - float64(q)) / 127
-	return math.Hypot(j, k)
-}
+// A lookup table for calculating magnitude of an interleaved unsigned byte
+// stream.
+type MagLUT []float64
 
-// Preamble detection uses half-complex dft to convolve signal with preamble
-// basis function, argmax of result represents most likely preamble position.
-type PreambleDetector struct {
-	forward  fftw.HCDFT1DPlan
-	backward fftw.HCDFT1DPlan
-
-	r        []float64
-	c        []complex128
-	template []complex128
-}
-
-func NewPreambleDetector() (pd PreambleDetector) {
-	// Plan forward and reverse transforms.
-	pd.forward = fftw.NewHCDFT1D(PreambleDFTSize, nil, nil, fftw.Forward, fftw.InPlace, fftw.Measure)
-	pd.r = pd.forward.Real
-	pd.c = pd.forward.Complex
-	pd.backward = fftw.NewHCDFT1D(PreambleDFTSize, pd.r, pd.c, fftw.Backward, fftw.PreAlloc, fftw.Measure)
-
-	// Zero out input array.
-	for i := range pd.r {
-		pd.r[i] = 0
+// Shifts sample by 127.4 (most common DC offset value of rtl-sdr dongles) and
+// stores square.
+func NewMagLUT() (lut MagLUT) {
+	lut = make([]float64, 0x100)
+	for idx := range lut {
+		lut[idx] = 127.4 - float64(idx)
+		lut[idx] *= lut[idx]
 	}
-
-	// Generate the preamble basis function.
-	for idx, bit := range PreambleBits {
-		// Must account for rounding error.
-		sIdx := idx << 1
-		lower := IntRound(float64(sIdx) * SymbolLength)
-		upper := IntRound(float64(sIdx+1) * SymbolLength)
-		for i := 0; i < upper-lower; i++ {
-			if bit == '1' {
-				pd.r[lower+i] = 1.0
-				pd.r[upper+i] = -1.0
-			} else {
-				pd.r[lower+i] = -1.0
-				pd.r[upper+i] = 1.0
-			}
-		}
-	}
-
-	// Transform the preamble basis function.
-	pd.forward.Execute()
-
-	// Create the preamble template and store conjugated dft result.
-	pd.template = make([]complex128, len(pd.c))
-	copy(pd.template, pd.c)
-	for i := range pd.template {
-		pd.template[i] = cmplx.Conj(pd.template[i])
-	}
-
 	return
-}
-
-// FFTW plans must be cleaned up.
-func (pd *PreambleDetector) Close() {
-	pd.forward.Close()
-	pd.backward.Close()
-}
-
-// Convolves signal with preamble basis function. Returns the most likely
-// position of preamble. Assumes data has been copied into real array.
-func (pd *PreambleDetector) Execute() int {
-	pd.forward.Execute()
-	for i := range pd.template {
-		pd.backward.Complex[i] = pd.forward.Complex[i] * pd.template[i]
-	}
-	pd.backward.Execute()
-
-	return pd.ArgMax()
-}
-
-// Calculate index of largest element in the real array.
-func (pd *PreambleDetector) ArgMax() (idx int) {
-	max := 0.0
-	for i, v := range pd.backward.Real {
-		if max < v {
-			max, idx = v, i
-		}
-	}
-	return idx
 }
 
 // Matched filter implemented as integrate and dump. Output array is equal to
 // the number of manchester coded symbols per packet.
-func MatchedFilter(input []float64) (output []float64) {
-	output = make([]float64, IntRound(PacketSymbols/2))
-	fidx := 0
-	for idx := 0.0; fidx < 96; idx += SymbolLength * 2 {
-		lower := IntRound(idx)
-		upper := IntRound(idx + SymbolLength)
-		for i := 0; i < upper-lower; i++ {
-			output[fidx] += input[lower+i] - input[upper+i]
+func MatchedFilter(input []float64, bits int) (output []float64) {
+	output = make([]float64, bits)
+
+	fIdx := 0
+	for idx := 0; fIdx < bits; idx += SymbolLength * 2 {
+		offset := idx + SymbolLength
+
+		for i := 0; i < SymbolLength; i++ {
+			output[fIdx] += input[idx+i] - input[offset+i]
 		}
-		fidx++
+		fIdx++
+	}
+	return
+}
+
+func BitSlice(input []float64) (output string) {
+	for _, v := range input {
+		if v > 0.0 {
+			output += "1"
+		} else {
+			output += "0"
+		}
 	}
 	return
 }
@@ -396,6 +265,27 @@ func MatchedFilter(input []float64) (output []float64) {
 func ParseUint(raw string) uint64 {
 	tmp, _ := strconv.ParseUint(raw, 2, 64)
 	return tmp
+}
+
+// Message for logging.
+type Message struct {
+	Time   time.Time
+	Offset int64
+	Length int
+	SCM    SCM
+}
+
+func (msg Message) String() string {
+	// If we aren't dumping samples, omit offset and packet length.
+	if config.sampleFilename == os.DevNull {
+		return fmt.Sprintf("{Time:%s SCM:%+v}\n",
+			msg.Time.Format(TimeFormat), msg.SCM,
+		)
+	}
+
+	return fmt.Sprintf("{Time:%s Offset:%d Length:%d SCM:%+v}\n",
+		msg.Time.Format(TimeFormat), msg.Offset, msg.Length, msg.SCM,
+	)
 }
 
 // Standard Consumption Message
@@ -438,142 +328,43 @@ func ParseSCM(data string) (scm SCM, err error) {
 	return scm, nil
 }
 
-// BCH Error Correction
-type BCH struct {
-	GenPoly   uint
-	PolyLen   byte
-	Syndromes map[uint][]uint
-}
-
-// Given a generator polynomial, calculate the polynomial length and pre-
-// compute syndromes for number of errors to be corrected.
-func NewBCH(poly uint) (bch BCH) {
-	bch.GenPoly = poly
-
-	p := bch.GenPoly
-	for ; bch.PolyLen < 32 && p > 0; bch.PolyLen, p = bch.PolyLen+1, p>>1 {
-	}
-	bch.PolyLen--
-
-	bch.ComputeSyndromes(MsgLen, ErrorCount)
-
-	return
-}
-
-func (bch BCH) String() string {
-	return fmt.Sprintf("{GenPoly:%X PolyLen:%d Syndromes:%d}", bch.GenPoly, bch.PolyLen, len(bch.Syndromes))
-}
-
-// Recursively computes syndromes for number of desired errors.
-func (bch *BCH) ComputeSyndromes(msgLen, errCount uint) {
-	bch.Syndromes = make(map[uint][]uint)
-
-	data := make([]byte, msgLen)
-	bch.computeHelper(msgLen, errCount, nil, data)
-}
-
-func (bch *BCH) computeHelper(msgLen, depth uint, prefix []uint, data []byte) {
-	if depth == 0 {
-		return
-	}
-
-	// For all possible bit positions.
-	for i := uint(0); i < msgLen<<3; i++ {
-		inPrefix := false
-		for p := uint(0); p < uint(len(prefix)) && !inPrefix; p++ {
-			inPrefix = i == prefix[p]
-		}
-		if inPrefix {
-			continue
-		}
-
-		// Toggle the bit
-		data[i>>3] ^= 1 << uint(i%8)
-
-		// Calculate the syndrome and store with position if new.
-		syn := bch.Encode(data)
-		if _, exists := bch.Syndromes[syn]; !exists {
-			bch.Syndromes[syn] = append(prefix, i)
-		}
-
-		// Recurse.
-		bch.computeHelper(msgLen, depth-1, append(prefix, i), data)
-
-		data[i>>3] ^= 1 << uint(i%8)
-	}
-}
-
-// Syndrome calculation implemented using LSFR (linear feedback shift register).
-func (bch BCH) Encode(data []byte) (checksum uint) {
-	// For each byte of data.
-	for _, b := range data {
-		// For each bit of byte.
-		for i := byte(0); i < 8; i++ {
-			// Rotate register and shift in bit.
-			checksum = (checksum << 1) | uint((b>>(7-i))&1)
-			// If MSB of register is non-zero XOR with generator polynomial.
-			if checksum>>bch.PolyLen != 0 {
-				checksum ^= bch.GenPoly
-			}
-		}
-	}
-
-	// Mask to valid length
-	checksum &= (1 << bch.PolyLen) - 1
-	return
-}
-
-// Given data, calculate the syndrome and correct errors if syndrome exists in
-// pre-computed syndromes.
-func (bch BCH) Correct(data []byte) (checksum uint, corrected bool) {
-	// Calculate syndrome.
-	syn := bch.Encode(data)
-	if syn == 0 {
-		return syn, false
-	}
-
-	// If the syndrome exists then toggle bits the syndrome was
-	// calculated from.
-	if pos, exists := bch.Syndromes[syn]; exists {
-		for _, b := range pos {
-			data[b>>3] ^= 1 << uint(b%8)
-		}
-	}
-
-	// Calculate syndrome of corrected version. If we corrected anything, indicate so.
-	checksum = bch.Encode(data)
-	if syn != checksum && checksum == 0 {
-		corrected = true
-	}
-
-	return
-}
-
-func IntRound(i float64) int {
-	return int(math.Floor(i + 0.5))
-}
-
 func init() {
 	err := config.Parse()
 	if err != nil {
-		log.Fatal("Error parsing flags:", err)
+		config.Log.Fatal("Error parsing flags:", err)
 	}
 }
 
 func main() {
-	log.Println("Config:", config)
-	log.Println("BlockSize:", BlockSize)
-	log.Println("SampleRate:", SampleRate)
-	log.Println("DataRate:", DataRate)
-	log.Println("SymbolLength:", SymbolLength)
-	log.Println("PacketSymbols:", PacketSymbols)
-	log.Println("PacketLength:", PacketLength)
-	log.Println("CenterFreq:", CenterFreq)
+	if !config.Quiet {
+		config.Log.Println("Server:", config.ServerAddr)
+		config.Log.Println("BlockSize:", BlockSize)
+		config.Log.Println("SampleRate:", SampleRate)
+		config.Log.Println("DataRate:", DataRate)
+		config.Log.Println("SymbolLength:", SymbolLength)
+		config.Log.Println("PreambleSymbols:", PreambleSymbols)
+		config.Log.Println("PreambleLength:", PreambleLength)
+		config.Log.Println("PacketSymbols:", PacketSymbols)
+		config.Log.Println("PacketLength:", PacketLength)
+		config.Log.Println("CenterFreq:", config.CenterFreq)
+		config.Log.Println("TimeLimit:", config.TimeLimit)
+
+		config.Log.Println("Format:", config.format)
+		config.Log.Println("LogFile:", config.logFilename)
+		config.Log.Println("SampleFile:", config.sampleFilename)
+
+		if config.MeterID != 0 {
+			config.Log.Println("FilterID:", config.MeterID)
+		}
+	}
 
 	rcvr := NewReceiver(BlockSize)
 	defer rcvr.Close()
 	defer config.Close()
 
-	log.Println("Running...")
+	if !config.Quiet {
+		config.Log.Println("Running...")
+	}
+
 	rcvr.Run()
 }
